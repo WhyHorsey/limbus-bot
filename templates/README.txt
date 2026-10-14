@@ -1,4 +1,7 @@
-Put your own cropped UI templates in this directory.
+This folder documents the template names. The real templates are stored in your user config folder, shown in the app and by `python micro_manager.py --doctor`:
+
+  Windows: %APPDATA%\limbus-micro-manager\templates
+  Linux:   ~/.config/limbus-micro-manager/templates
 
 State templates (configured in config.json):
   state_battle.png
@@ -9,6 +12,8 @@ State templates (configured in config.json):
   state_result.png
   state_run_complete.png
   state_lux_stage_select.png
+  state_mode_select.png
+  state_gift_upgrade.png
 
 Common action templates:
   button_continue.png
@@ -20,6 +25,7 @@ Common action templates:
   button_leave_shop.png
   button_gift_fallback.png
   button_event_fallback.png
+  button_confirm_upgrade.png
 
 Mirror Dungeon reachable-node templates:
   node_event_available.png
@@ -29,18 +35,13 @@ Mirror Dungeon reachable-node templates:
   node_normal_available.png
   node_risky_available.png
 
-Gift/upgrade/event templates can use any filename, as long as the exact filename
-is entered in the GUI priorities. Example: gift_priority_1.png, upgrade_priority_1.png,
-event_best.png.
+Gift/upgrade/event templates may use any filename. The calibration wizard can name and automatically add them to the relevant priority list.
 
-Template guidelines:
-- Use screenshots from the same game language and UI scale you intend to run.
-- Crop a small, distinctive, stable area. Avoid animated effects and changing numbers.
-- For state templates, crop a heading or stable panel that identifies the current screen.
-- For node templates, crop the *available/selectable* variant, not the same icon shown on every node.
-- Test with clicks disabled first. A wrong or overly generic template can misidentify a screen.
-
-The GUI also has a “Capture template…” button. It minimizes the app, captures
-the screen after a short delay, and opens a crop selector. Bring the game to the
-foreground as soon as the app minimizes. Save the crop using a filename from
-the lists above; the file is stored in the user config's templates folder.
+Calibration guidelines:
+- Capture from the same game language, UI scale and display arrangement you'll use later.
+- For state templates, crop a distinctive and stable heading/panel; for battle, prefer a visible skill-selection/Win Rate indicator over persistent battle art.
+- For action templates, crop the specific button rather than a large surrounding panel.
+- For node templates, crop the available/selectable state, not an icon shown on every node.
+- For gift/upgrade/event templates, crop a distinctive card detail that stays stable.
+- Analyze the current screen and keep input disabled until detections have been verified.
+- The calibration wizard uses an in-app crop window, so it does not depend on OpenCV's separate `selectROI` GUI.

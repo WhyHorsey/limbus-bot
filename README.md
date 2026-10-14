@@ -1,31 +1,61 @@
 # Limbus Micro Manager
 
-A small, original Python GUI starter for configurable Limbus Company farming workflows. It is inspired by the *feature categories* of LixAssistantLimbusCompany, but does not copy its source code or ship its game assets.
+A configurable, template-driven Python GUI starter for Limbus Company farming workflows. It is inspired by the *feature categories* of LixAssistantLimbusCompany, but does not copy its source code or ship its game assets.
 
-> **Important:** This is a template-driven foundation, not a verified turnkey bot. It does not include proprietary game screenshots, and the UI/state templates must be calibrated by you. Never run unattended until you've tested the templates with input disabled. Automation may carry account/game-rule risk; review the game's current rules and use at your own discretion.
+> **Important:** This remains a user-calibrated automation framework, not a verified turnkey bot. It does not include proprietary game screenshots, read game memory, or know the game's full route/gift database. You must capture UI templates from your own game client. Automating gameplay may carry account/game-rule risk; check the current rules and use your own judgement.
 
-## Features in this build
+## Added in this build
 
-- Tkinter GUI, JSON settings, activity log.
-- Mirror Dungeon / Luxcavation EXP / Luxcavation Thread mode profiles.
-- Win Rate policy sends `P` when the configured battle screen is detected; optional custom key sequence or manual mode.
-- Route priority for recognized *available* node types.
-- Ordered E.G.O Gift, shop upgrade, and event-option image templates; optional gift blacklist.
-- Stops after a configured number of completed runs if the run-complete template is recognized.
-- Windows and X11 input path via PyAutoGUI.
-- Wayland best-effort screen capture via `spectacle`, `gnome-screenshot`, or `grim`; input uses `ydotool` if configured.
-- F8 toggles and F9 stops on Windows/X11. Wayland global shortcuts should be registered in the desktop environment and call this script with `--toggle` or `--stop`.
-- Unknown screens are ignored; template/input errors stop the worker rather than continuing to click.
+- Tkinter GUI with saved JSON settings and activity log.
+- Mirror Dungeon, Luxcavation EXP, and Luxcavation Thread profiles.
+- Win Rate (`P`), custom key sequence, or manual battle policy.
+- Guided calibration wizard: choose a role, capture the current desktop, drag a crop in the app, and automatically link it to a state, button, node, gift, upgrade, event option, or blacklist entry.
+- Template library: preview and remove templates, see where each filename is linked, and refresh the list after a capture.
+- Screen analyzer: takes a screenshot, displays raw match scores and coordinates for configured states, and highlights matches. It sends **no** input.
+- Template file check across all configured states, actions, route nodes and priority lists.
+- Import/export farming profiles as JSON. Profiles include settings and template filenames, not the actual image files.
+- Route priorities plus a spatial tie-breaker: highest-confidence, leftmost, rightmost, or closest to screen center among matches for the highest-priority node category.
+- Ordered gift, shop upgrade, and event-option templates; gift blacklist; optional calibrated fallbacks.
+- Optional gift-upgrade state handling and a calibrated upgrade-confirm button.
+- Repeat-action guard: after an action, it waits for a material screen change before acting again on the same recognized state. Full-run completion is counted only once until another known state is seen.
+- Start/stop through GUI; F8 toggles and F9 stops under supported Windows/X11 global-hook environments. Under Wayland, use a desktop global shortcut calling `--toggle` or `--stop`.
+- `--doctor` command to inspect Python dependencies and desktop capture/input backends.
+- Unknown screens are ignored; unexpected worker errors stop the automation.
 
 ## Requirements
 
 - Python 3.10+
-- Tkinter (normally included on Windows; on Fedora install `python3-tkinter` if your Python environment provides it as a separate package)
 - Python packages in `requirements.txt`
-- On KDE Wayland, `spectacle` is the preferred capture backend; on GNOME Wayland, `gnome-screenshot`; on wlroots desktops, `grim` may work.
-- On Wayland, install and configure `ydotool` and its service/daemon for automated input. This varies by distro and desktop; the program does not attempt to change device permissions or enable a privileged daemon for you.
+- Tkinter for the GUI and PyAutoGUI's MouseInfo helper on Linux. It is normally included with Python on Windows.
+- A supported screen-capture method: PyAutoGUI outside Wayland; on Wayland, a compositor-friendly screenshot utility such as Spectacle, `gnome-screenshot`, or `grim`.
+- On Wayland, input injection needs `ydotool` and a correctly configured daemon/service. Exact setup depends on the distribution and compositor; the app does not change privileged device permissions for you.
 
-## Install
+### Debian / Ubuntu
+
+The Tkinter and Python development packages named in the MouseInfo warning are:
+
+```bash
+sudo apt-get update
+sudo apt-get install python3-tk python3-dev
+```
+
+If using GNOME Wayland, also install the screenshot utility:
+
+```bash
+sudo apt-get install gnome-screenshot
+```
+
+### Fedora (including Fedora KDE Wayland)
+
+Fedora uses different package names:
+
+```bash
+sudo dnf install python3-tkinter python3-devel spectacle
+```
+
+`python3-tkinter` provides Tkinter. `python3-devel` provides development headers for packages that may need them during installation. Spectacle is a preferred screenshot tool on KDE Plasma; on GNOME, use `gnome-screenshot` instead.
+
+Use a virtual environment after installing the system Tk package. The venv uses the matching system Python's standard library, including Tkinter. If you're using a custom Python build (for example, from pyenv), its Tkinter support must be built/configured for that interpreter separately.
 
 ### Windows (PowerShell)
 
@@ -33,6 +63,7 @@ A small, original Python GUI starter for configurable Limbus Company farming wor
 cd path\to\limbus_micro_manager
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
+py -m pip install --upgrade pip
 py -m pip install -r requirements.txt
 py micro_manager.py
 ```
@@ -40,74 +71,120 @@ py micro_manager.py
 ### Fedora Linux
 
 ```bash
-sudo dnf install python3 python3-tkinter spectacle
+sudo dnf install python3 python3-tkinter python3-devel spectacle
 cd /path/to/limbus_micro_manager
 python3 -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 python micro_manager.py
 ```
 
-On Fedora, package names can vary depending on enabled repositories/Python version. You may use your system Python if Tkinter isn't available inside your venv.
+### Debian / Ubuntu Linux
 
-## Configure templates
+```bash
+sudo apt-get install python3 python3-tk python3-dev gnome-screenshot
+cd /path/to/limbus_micro_manager
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python micro_manager.py
+```
 
-1. Launch the app once; it creates its user config and templates folder.
-2. Click **Open templates folder**. The default folders are:
+## First launch and preflight
+
+1. Run `python micro_manager.py --doctor` in the venv. It reports Python, Tkinter, OpenCV, Pillow, screenshot programs, and input backends.
+2. Launch with `python micro_manager.py`. The app creates a config directory and template folder:
    - Windows: `%APPDATA%\limbus-micro-manager\templates`
    - Linux: `~/.config/limbus-micro-manager/templates`
-3. Capture your own screenshots with the game in its normal display mode, then crop stable labels/panels into the filenames listed in `templates/README.txt`. Copy the image files into the user templates folder.
-4. Keep the game language and UI scale consistent between calibration and use.
-5. Review `config.json` in the user config folder to map extra state or action templates if needed.
-6. Turn off **Allow mouse/keyboard input** and start the app. Check the activity log and template matches before enabling input.
-7. Re-enable input only after every screen/action is reliably detected. Start with one run, and stay nearby to supervise it.
+3. Keep **Allow mouse/keyboard input** off while calibrating. This is the default for new installs.
+4. Set your Identity/team and desired farming stage in game yourself. The manager does not change team composition.
+5. Capture and test the relevant state and action templates before enabling input.
 
-Template matching searches the whole display and clicks the center of the matched crop. Avoid templates that appear in more than one UI location. If your screen resolution or UI scale changes, recapture the templates.
+## Template calibration workflow
 
-### Decision lists
+Use **Calibrate / capture…**:
 
-Entries are comma-separated and ordered from highest to lowest priority.
+1. Choose the role: state screen, action button, route node, E.G.O Gift priority, shop upgrade priority, event option priority, or gift blacklist.
+2. For state/button/node roles, choose the key to link (for example `battle`, `continue`, or `shop`). For gift/upgrade/event cards, enter a short name.
+3. Bring the game to the foreground after the main window minimizes. The app captures the desktop.
+4. Drag a tight rectangle around a distinctive UI element in the in-app crop window, then save it. The crop is saved at full screenshot resolution and linked to the role you chose.
+5. Click **Analyze current screen**. Check the confidence, coordinates, and green rectangles. The analyzer never clicks or types.
+6. Click **Check templates** to see if configured references point to existing files. Use **Manage templates…** to preview and remove image files.
+7. Test with dry-run enabled and watch the log. Only enable real input after checking every action on the actual screen. Begin with one run and supervise it.
 
-- **Route:** names such as `event, shop, rest, focused, normal, risky`. Each name maps to `node_<name>_available.png` in `node_templates`.
-- **E.G.O Gifts:** exact template filenames for gift cards, e.g. `gift_my_priority.png, gift_second_choice.png`.
-- **Blacklist:** filenames that the gift selector should skip.
-- **Shop upgrades:** exact template filenames, highest priority first.
-- **Event options:** exact template filenames, highest priority first.
+Capture all templates with the same game language, UI scale and display arrangement you plan to use. A state template should be a stable, distinctive heading or panel; an action template should cover only the intended button; a node template must show the **available/selectable** variant. Avoid common backgrounds, repeated decorations, numbers that change, and animations.
 
-This build chooses the first matched configured template. It does not infer game mechanics, evaluate gift synergies, reconstruct every dungeon path, or calculate combat odds. Your templates and priority rules supply those decisions. Team/Identity composition remains manual.
+## Decision priorities
+
+Priority fields are comma-separated; entries are evaluated from left to right.
+
+- **Route:** values such as `event, shop, rest, focused, normal, risky`. The app evaluates categories in that order. The route tie-breaker is applied only when multiple matches exist for the same category.
+- **E.G.O Gifts:** filenames of gift-card crops, best first. The configured blacklist is applied here.
+- **Shop upgrades:** filenames of upgrade-card crops, best first.
+- **Event options:** filenames of event-option crops, best first.
+
+The manager uses exact image-template matches. It does not infer synergy from gift names, read text with OCR, evaluate all gift mechanics, or reconstruct the dungeon's node graph. Spatial route tie-breakers are heuristics, not a true pathfinding algorithm. If a desired gift/upgrade has not been calibrated and added to its priority list, it cannot intentionally prefer it.
+
+For gift-upgrade interactions, capture `state_gift_upgrade.png` with the wizard (state key `gift_upgrade`), then add upgrade card templates. Only calibrate `button_confirm_upgrade.png` if clicking that specific confirmation is genuinely desired; this action may confirm an in-game choice.
+
+## Repeated-action guard and timing
+
+After a click/key action, the manager records a reduced screen signature. While it still recognizes the same state, it will not act again until the full screen's visual difference reaches the configured **Screen-change threshold**. This helps prevent repeated clicks on an unchanged screen and allows a new selection after a substantial UI change. It is still a heuristic: animated scenes or large visual effects can look like a change. For combat, crop `state_battle.png` around the skill-selection/Win Rate controls rather than a persistent background. Raise the screen-change threshold if actions repeat during animations; lower it cautiously if new choice cards are not handled.
+
+The run-completion state has an additional latch: one visible completion screen counts as one completed run, not one run per polling loop. It resets after a different known state is recognized.
 
 ## Keyboard shortcuts
 
 ### Windows / X11
 
-- `F8`: toggle automation.
+- `F8`: toggle automation on/off.
 - `F9`: stop automation.
 
 ### KDE/GNOME Wayland
 
-Global keyboard hooks are restricted on Wayland, so register a desktop shortcut through **System Settings → Keyboard → Shortcuts** (exact labels vary) and use a command like:
+Wayland intentionally delegates global shortcuts to the desktop compositor. Register a global shortcut in your desktop settings and use a command such as:
 
 ```bash
 /path/to/limbus_micro_manager/.venv/bin/python /path/to/limbus_micro_manager/micro_manager.py --toggle
 ```
 
-Use `--stop` for an emergency stop shortcut. Launch the GUI normally first. The `--toggle` command sends a local-only command over `127.0.0.1`; it doesn't expose a listening service to your network.
+For a stop-only shortcut, use `--stop`. The GUI must already be running. The command talks to the GUI over `127.0.0.1` only; it does not expose a listener to the network.
 
-## Safety and known limitations
+## Profiles
 
-- Do not use the bot on screens you have not calibrated.
-- `P` is sent only after a screen matching `state_battle.png` is detected. The behavior of that key may change with game updates/settings.
-- A generic `state_result.png` is not assumed to mean an entire run is complete; configure a distinct `state_run_complete.png` crop for a true full-run completion screen.
-- Luxcavation stage selection is only triggered if a `state_lux_stage_select.png` template is detected and the matching stage-start template is found. Check that the template corresponds to the desired stage.
-- Wayland permissions and screenshot/input tools differ by compositor. GUI start/stop works even when global hotkeys or input injection are unavailable.
-- If the game updates, recapture the templates and re-test in dry-run mode.
+Use **Export profile…** and **Import profile…** to save/load JSON settings for different farming modes. Profiles store configuration and template filenames but do not bundle the template image files. Copy your template folder separately when moving profiles to another computer. Importing a profile deliberately switches input off, so review the local templates and re-enable input manually only after testing.
 
 ## Troubleshooting
 
-- **No screen detected:** confirm a state template exists, is cropped from the right UI, and is in the active user templates directory.
-- **Wayland capture fails:** configure the desktop-appropriate screenshot utility or set `capture_command` in `config.json`, using `{output}` as the output-file placeholder.
-- **Wayland clicks/keys fail:** configure `ydotool` with your distro's documentation; do not blindly change permissions on `/dev/uinput`.
-- **A wrong button is selected:** immediately stop, disable clicks, and recapture a smaller/unique template with a more conservative threshold.
+- **`NOTE: You must install tkinter on Linux to use MouseInfo`:** Debian/Ubuntu: install `python3-tk python3-dev`; Fedora: install `python3-tkinter python3-devel`. Then retry `python -m pip install -r requirements.txt` using the same Python environment.
+- **No state detected:** use **Analyze current screen**; verify files and scores, then recapture a tight/unique state crop. No input is sent by analysis.
+- **Capture fails on Wayland:** install the screenshot backend appropriate to the desktop; `--doctor` lists commands it can find.
+- **Mouse/keyboard input fails on Wayland:** install/configure `ydotool` and its daemon using your distribution's instructions. Do not blindly change permissions on `/dev/uinput`.
+- **Wrong template target:** stop immediately, disable input, and recapture a smaller crop. Re-test the annotated screen before resuming.
+- **Game update or UI scaling changes:** recapture affected templates and test again.
+- **`--doctor` says PyAutoGUI is unavailable but you're in a headless terminal:** that can be normal without an accessible display. Run the app from your active desktop session, not from a headless SSH shell.
+
+## Safety and known limitations
+
+- Keep input disabled while calibrating and reviewing matches.
+- The manager uses ordinary screen capture and desktop input; it does not interact with game memory.
+- On unknown states or missing templates, it waits rather than guessing coordinates.
+- It has not been end-to-end tested against a live game client on either platform. You must confirm the actual `P` mapping and verify every captured screen/button before using input automation.
+- Automation may conflict with the game's terms or enforcement policies. Review current policies before deciding whether to use it.
+
+## Tests
+
+From the project folder:
+
+```bash
+python -m unittest discover -s tests -v
+python -m py_compile micro_manager.py
+python micro_manager.py --doctor
+```
+
+The unit tests use synthetic images and test core matching/route-selection behavior; they do not simulate a live game client.
 
 ## License
 

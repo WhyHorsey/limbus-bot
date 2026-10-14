@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import platform
+import re
 import queue
 import shutil
 import socket
@@ -30,11 +31,13 @@ except ImportError:
     cv2 = None
     np = None
 
+_PYAUTOGUI_IMPORT_ERROR = None
 try:
     import pyautogui
-except Exception:
+except Exception as exc:
     # PyAutoGUI may fail during import on headless Linux or sessions without X11.
     pyautogui = None
+    _PYAUTOGUI_IMPORT_ERROR = str(exc)
 
 try:
     from pynput import keyboard as pynput_keyboard
@@ -47,6 +50,7 @@ IPC_HOST = "127.0.0.1"
 IPC_PORT = 49271
 
 DEFAULT_CONFIG = {
+    "config_version": 2,
     "mode": "Mirror Dungeon",
     "target_runs": 1,
     "battle_policy": "win_rate",
@@ -54,11 +58,13 @@ DEFAULT_CONFIG = {
     "loop_delay_seconds": 1.0,
     "transition_wait_seconds": 3.0,
     "template_threshold": 0.88,
+    "screen_change_threshold": 0.08,
+    "route_strategy": "priority_then_confidence",
     "route_priority": ["event", "shop", "rest", "focused", "normal", "risky"],
-    "gift_priority": ["gift_priority_1.png", "gift_priority_2.png"],
+    "gift_priority": [],
     "gift_blacklist": [],
-    "upgrade_priority": ["upgrade_priority_1.png", "upgrade_priority_2.png"],
-    "event_priority": ["event_best.png", "event_safe.png", "event_skip.png"],
+    "upgrade_priority": [],
+    "event_priority": [],
     "state_templates": {
         "battle": "state_battle.png",
         "map": "state_map.png",
@@ -68,6 +74,8 @@ DEFAULT_CONFIG = {
         "result": "state_result.png",
         "run_complete": "state_run_complete.png",
         "lux_stage_select": "state_lux_stage_select.png",
+        "mode_select": "state_mode_select.png",
+        "gift_upgrade": "state_gift_upgrade.png",
     },
     "action_templates": {
         "continue": "button_continue.png",
@@ -79,6 +87,7 @@ DEFAULT_CONFIG = {
         "leave_shop": "button_leave_shop.png",
         "gift_fallback": "button_gift_fallback.png",
         "event_fallback": "button_event_fallback.png",
+        "confirm_upgrade": "button_confirm_upgrade.png",
     },
     "node_templates": {
         "event": "node_event_available.png",
@@ -89,7 +98,7 @@ DEFAULT_CONFIG = {
         "risky": "node_risky_available.png",
     },
     "capture_command": "",
-    "clicks_enabled": True,
+    "clicks_enabled": False,
 }
 
 
@@ -117,15 +126,27 @@ def load_config() -> dict:
         saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         saved = {}
+    if not isinstance(saved, dict):
+        saved = {}
+    try:
+        previous_version = int(saved.get("config_version", 1))
+    except (TypeError, ValueError):
+        previous_version = 1
     config = copy.deepcopy(DEFAULT_CONFIG)
-    if isinstance(saved, dict):
-        config.update(saved)
-    # Preserve new default keys when opening a config made by an older version.
+    config.update(saved)
+    # Preserve new defaults and nested mappings when opening an older config.
     for key in ("state_templates", "action_templates", "node_templates"):
         merged = copy.deepcopy(DEFAULT_CONFIG[key])
         if isinstance(config.get(key), dict):
             merged.update(config[key])
         config[key] = merged
+    # Older builds defaulted live input to enabled. On upgrade, move to a safe
+    # dry-run until the user explicitly re-enables input in the GUI.
+    if previous_version < 2:
+        config["clicks_enabled"] = False
+    config["config_version"] = 2
+    if previous_version < 2 or saved.get("config_version") != 2:
+        save_config(config)
     return config
 
 
@@ -313,6 +334,23 @@ class TemplateMatcher:
         matches = self.match_all(screen, filename, threshold)
         return matches[0] if matches else None
 
+    def best_unfiltered(self, screen, filename: str):
+        """Return the best raw match even below threshold; diagnostics only."""
+        template = self._read_template(filename)
+        if template is None:
+            return None
+        screen_gray = cv2.cvtColor(screen, cv2.COLOR_BGR2GRAY) if len(screen.shape) == 3 else screen
+        th, tw = template.shape[:2]
+        sh, sw = screen_gray.shape[:2]
+        if th > sh or tw > sw:
+            return None
+        result = cv2.matchTemplate(screen_gray, template, cv2.TM_CCOEFF_NORMED)
+        _min_val, max_val, _min_loc, max_loc = cv2.minMaxLoc(result)
+        return (int(max_loc[0]), int(max_loc[1]), float(max_val), int(tw), int(th))
+
+    def clear_cache(self) -> None:
+        self._cache.clear()
+
     def find_state(self, screen, state_templates: dict) -> tuple[Optional[str], float]:
         best_state, best_score = None, -1.0
         for state, filename in state_templates.items():
@@ -320,6 +358,36 @@ class TemplateMatcher:
             if match and match[2] > best_score:
                 best_state, best_score = state, match[2]
         return best_state, best_score
+
+
+def screen_signature(screen):
+    """Small grayscale signature used to prevent repeat-clicking an unchanged screen."""
+    gray = cv2.cvtColor(screen, cv2.COLOR_BGR2GRAY) if len(screen.shape) == 3 else screen
+    reduced = cv2.resize(gray, (48, 27), interpolation=cv2.INTER_AREA)
+    return reduced.astype(np.float32)
+
+
+def signature_delta(first, second) -> float:
+    if first is None or second is None or first.shape != second.shape:
+        return 1.0
+    return float(np.mean(cv2.absdiff(first, second)) / 255.0)
+
+
+def choose_route_match(matches, strategy: str, screen_width: int, screen_height: int):
+    """Choose one of a node type's image matches using a configurable tie-breaker."""
+    if not matches:
+        return None
+    if strategy == "priority_then_leftmost":
+        return min(matches, key=lambda item: item[0])
+    if strategy == "priority_then_rightmost":
+        return max(matches, key=lambda item: item[0] + item[3] // 2)
+    if strategy == "priority_then_center":
+        return min(matches, key=lambda item: (
+            (item[0] + item[3] / 2 - screen_width / 2) ** 2
+            + (item[1] + item[4] / 2 - screen_height / 2) ** 2
+        ))
+    # match_all returns matches in descending confidence order.
+    return matches[0]
 
 
 class AutomationWorker:
@@ -334,6 +402,11 @@ class AutomationWorker:
         self.runs_done = 0
         self.last_action_time = 0.0
         self.last_state = None
+        self.last_action_state: Optional[str] = None
+        self.last_action_signature = None
+        self.current_state: Optional[str] = None
+        self.run_complete_latched = False
+        self.last_wait_log: dict[str, float] = {}
         self.started = False
 
     def start(self):
@@ -342,10 +415,15 @@ class AutomationWorker:
             return
         self.stop_event.clear()
         self.runs_done = 0
+        self.last_state = None
+        self.last_action_state = None
+        self.last_action_signature = None
+        self.current_state = None
+        self.run_complete_latched = False
         self.started = True
+        self.status("Starting")
         self.thread = threading.Thread(target=self._run, name="limbus-automation", daemon=True)
         self.thread.start()
-        self.status("Running")
 
     def stop(self, reason: str = "Stopped by user"):
         self.stop_event.set()
@@ -366,14 +444,42 @@ class AutomationWorker:
         while time.monotonic() < end and not self.stop_event.is_set():
             time.sleep(min(0.1, end - time.monotonic()))
 
+    def _record_action(self, screen) -> None:
+        """Latch the action until the recognized screen changes materially."""
+        self.last_action_state = self.current_state
+        self.last_action_signature = screen_signature(screen)
+        self.last_action_time = time.monotonic()
+
+    def _may_act_on_screen(self, state: str, screen, cfg: dict) -> bool:
+        if self.last_action_state != state:
+            return True
+        # Never count/re-enter the full-run completion action twice until a
+        # different known state appears. This avoids falsely counting one run
+        # multiple times when the completion screen stays visible.
+        if state == "run_complete":
+            return False
+        delta = signature_delta(screen_signature(screen), self.last_action_signature)
+        threshold = max(0.05, min(0.5, float(cfg.get("screen_change_threshold", 0.15))))
+        if delta >= threshold:
+            self.log(f"Screen '{state}' changed (visual delta {delta:.2f}); allowing next configured action.")
+            return True
+        return False
+
+    def _log_throttled(self, key: str, message: str, interval: float = 8.0) -> None:
+        now = time.monotonic()
+        if now - self.last_wait_log.get(key, 0.0) >= interval:
+            self.last_wait_log[key] = now
+            self.log(message)
+
     def _click_named(self, screen, action_name: str, actions: dict) -> bool:
         filename = actions.get(action_name, "")
         match = self.matcher.best(screen, filename)
         if not match:
-            self.log(f"Can't find action template '{filename}' for {action_name}; waiting instead of guessing.")
+            self._log_throttled(f"action:{action_name}", f"Can't find action template '{filename}' for {action_name}; waiting instead of guessing.")
             return False
         x, y, score, w, h = match
         self.io.click(x + w // 2, y + h // 2)
+        self._record_action(screen)
         self.log(f"Clicked '{action_name}' (match {score:.2f}).")
         self._cooldown()
         return True
@@ -387,10 +493,11 @@ class AutomationWorker:
             if match:
                 x, y, score, w, h = match
                 self.io.click(x + w // 2, y + h // 2)
+                self._record_action(screen)
                 self.log(f"Selected {label}: {filename} (match {score:.2f}).")
                 self._cooldown()
                 return True
-        self.log(f"No configured {label} template matched; waiting instead of guessing.")
+        self._log_throttled(f"priority:{label}", f"No configured {label} template matched; waiting instead of guessing.")
         return False
 
     def _handle_state(self, state: str, screen, cfg: dict) -> None:
@@ -400,6 +507,7 @@ class AutomationWorker:
             policy = cfg.get("battle_policy", "win_rate")
             if policy == "win_rate":
                 self.io.press("p")
+                self._record_action(screen)
                 self.log("Battle: pressed P for the configured Win Rate action.")
                 self._cooldown()
             elif policy == "custom_keys":
@@ -412,25 +520,33 @@ class AutomationWorker:
                         return
                     self.io.press(key)
                     time.sleep(0.12)
+                self._record_action(screen)
                 self.log(f"Battle: sent custom key sequence {keys!r}.")
                 self._cooldown()
             else:
-                self.log("Battle policy is manual; waiting for your input.")
+                self._log_throttled("battle:manual", "Battle policy is manual; waiting for your input.")
                 time.sleep(1)
             return
 
         if state == "map" and mode == "Mirror Dungeon":
             node_templates = cfg.get("node_templates", {})
+            strategy = cfg.get("route_strategy", "priority_then_confidence")
+            screen_h, screen_w = screen.shape[:2]
             for node_type in cfg.get("route_priority", []):
                 filename = node_templates.get(node_type)
-                match = self.matcher.best(screen, filename or "")
-                if match:
-                    x, y, score, w, h = match
-                    self.io.click(x + w // 2, y + h // 2)
-                    self.log(f"Route: selected {node_type} node (match {score:.2f}).")
-                    self._cooldown()
-                    return
-            self.log("No reachable-node template matched; map left untouched.")
+                matches = self.matcher.match_all(screen, filename or "")
+                if not matches:
+                    continue
+                # Route type priority is applied first. If several available
+                # nodes share that type, this second policy picks the location.
+                match = choose_route_match(matches, strategy, screen_w, screen_h)
+                x, y, score, w, h = match
+                self.io.click(x + w // 2, y + h // 2)
+                self._record_action(screen)
+                self.log(f"Route: selected {node_type} node using {strategy} (match {score:.2f}).")
+                self._cooldown()
+                return
+            self._log_throttled("map:no-node", "No reachable-node template matched; map left untouched.")
             time.sleep(1)
             return
 
@@ -444,7 +560,7 @@ class AutomationWorker:
 
         if state == "shop":
             upgrades = cfg.get("upgrade_priority", [])
-            if self._click_priority_template(screen, upgrades, "upgrade", cfg.get("gift_blacklist", [])):
+            if self._click_priority_template(screen, upgrades, "upgrade"):
                 return
             self._click_named(screen, "leave_shop", actions)
             return
@@ -461,16 +577,31 @@ class AutomationWorker:
             return
 
         if state == "run_complete":
+            if self.run_complete_latched:
+                self._log_throttled("runcomplete:latched", "Run-complete screen already counted; waiting for a different recognized screen.")
+                return
+            self.run_complete_latched = True
             self.runs_done += 1
             target = max(1, int(cfg.get("target_runs", 1)))
             self.log(f"Completed run {self.runs_done}/{target}.")
             if self.runs_done >= target:
                 self.stop("Target run count reached.")
                 return
-            if mode == "Luxcavation (EXP)" or mode == "Luxcavation (Thread)":
+            if mode in ("Luxcavation (EXP)", "Luxcavation (Thread)"):
                 self._click_named(screen, "retry_lux", actions)
             else:
                 self._click_named(screen, "enter_mirror_again", actions)
+            return
+
+        if state == "mode_select" and mode == "Mirror Dungeon":
+            self._click_named(screen, "start_mirror", actions)
+            return
+
+        if state == "gift_upgrade":
+            if self._click_priority_template(screen, cfg.get("upgrade_priority", []), "E.G.O Gift upgrade"):
+                return
+            # Confirmation is only attempted if the user has explicitly calibrated it.
+            self._click_named(screen, "confirm_upgrade", actions)
             return
 
         if state == "lux_stage_select" and mode.startswith("Luxcavation"):
@@ -491,6 +622,13 @@ class AutomationWorker:
         if missing:
             self.log(f"Template setup incomplete: {len(missing)} state templates are missing in {TEMPLATES_DIR}.")
             self.log("Capture the stable UI labels/panels described in README.md before enabling farming.")
+        present_states = [name for name in cfg.get("state_templates", {}).values() if name and (TEMPLATES_DIR / name).is_file()]
+        if cfg.get("clicks_enabled", False) and not present_states:
+            self.log("Preflight failed: no state templates are available. Input automation was not started.")
+            self.status("Preflight failed")
+            self.stop_event.set()
+            self.started = False
+            return
         self.log(f"Started in mode: {cfg.get('mode')}; target runs: {cfg.get('target_runs')}.")
         self.log("Safety rule: screens that don't match a known template are never clicked.")
 
@@ -506,6 +644,13 @@ class AutomationWorker:
                 if state != self.last_state:
                     self.log(f"Detected screen: {state} (confidence {score:.2f}).")
                     self.last_state = state
+                    if state != "run_complete":
+                        self.run_complete_latched = False
+                self.current_state = state
+                if not self._may_act_on_screen(state, screen, cfg):
+                    self.status(f"Waiting for screen change · {state}")
+                    time.sleep(max(0.3, float(cfg.get("loop_delay_seconds", 1.0))))
+                    continue
                 self.status(f"Running · {state}")
                 self._handle_state(state, screen, cfg)
                 time.sleep(max(0.2, float(cfg.get("loop_delay_seconds", 1.0))))
@@ -522,16 +667,21 @@ class AutomationWorker:
 class MicroManagerApp:
     def __init__(self, root):
         import tkinter as tk
-        from tkinter import ttk, messagebox, simpledialog
+        from tkinter import ttk, messagebox, simpledialog, filedialog
 
         self.tk = tk
         self.ttk = ttk
         self.messagebox = messagebox
         self.simpledialog = simpledialog
+        self.filedialog = filedialog
         self.root = root
         self.root.title("Limbus Micro Manager")
-        self.root.geometry("820x760")
-        self.root.minsize(720, 640)
+        available_w = max(850, self.root.winfo_screenwidth() - 60)
+        available_h = max(660, self.root.winfo_screenheight() - 80)
+        initial_w = min(1080, available_w)
+        initial_h = min(800, available_h)
+        self.root.geometry(f"{initial_w}x{initial_h}")
+        self.root.minsize(min(900, initial_w), min(660, initial_h))
         self.config = load_config()
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.status_var = tk.StringVar(value="Stopped")
@@ -542,12 +692,14 @@ class MicroManagerApp:
         self.loop_delay_var = tk.StringVar(value=str(self.config.get("loop_delay_seconds", 1.0)))
         self.transition_var = tk.StringVar(value=str(self.config.get("transition_wait_seconds", 3.0)))
         self.threshold_var = tk.StringVar(value=str(self.config.get("template_threshold", 0.88)))
+        self.screen_change_var = tk.StringVar(value=str(self.config.get("screen_change_threshold", 0.08)))
+        self.route_strategy_var = tk.StringVar(value=self.config.get("route_strategy", "priority_then_confidence"))
         self.route_var = tk.StringVar(value=", ".join(self.config.get("route_priority", [])))
         self.gift_var = tk.StringVar(value=", ".join(self.config.get("gift_priority", [])))
         self.blacklist_var = tk.StringVar(value=", ".join(self.config.get("gift_blacklist", [])))
         self.upgrade_var = tk.StringVar(value=", ".join(self.config.get("upgrade_priority", [])))
         self.event_var = tk.StringVar(value=", ".join(self.config.get("event_priority", [])))
-        self.clicks_enabled_var = tk.BooleanVar(value=self.config.get("clicks_enabled", True))
+        self.clicks_enabled_var = tk.BooleanVar(value=self.config.get("clicks_enabled", False))
 
         self.worker = AutomationWorker(self.get_config, self.enqueue_log, self.set_status)
         self._build_ui()
@@ -597,6 +749,16 @@ class MicroManagerApp:
         ttk.Entry(settings, textvariable=self.threshold_var, width=10).grid(row=3, column=1, sticky="ew", pady=4)
         ttk.Checkbutton(settings, text="Allow mouse/keyboard input (turn off for dry-run)", variable=self.clicks_enabled_var).grid(row=3, column=2, columnspan=2, sticky="w", pady=4)
 
+        label("Route tie-breaker", 4)
+        ttk.Combobox(
+            settings, textvariable=self.route_strategy_var,
+            values=["priority_then_confidence", "priority_then_leftmost", "priority_then_rightmost", "priority_then_center"],
+            state="readonly", width=26,
+        ).grid(row=4, column=1, sticky="ew", pady=4)
+        label("Screen-change threshold", 4, 2)
+        ttk.Entry(settings, textvariable=self.screen_change_var, width=10).grid(row=4, column=3, sticky="w", pady=4)
+        ttk.Label(settings, text="Higher values require a bigger visual change before the same screen can trigger another action.", foreground="#666666").grid(row=5, column=0, columnspan=4, sticky="w", pady=(0, 2))
+
         priorities = ttk.LabelFrame(outer, text="Decision priorities", padding=10)
         priorities.pack(fill="x", pady=(0, 8))
         priorities.columnconfigure(1, weight=1)
@@ -611,15 +773,21 @@ class MicroManagerApp:
             ttk.Entry(priorities, textvariable=var).grid(row=row, column=1, sticky="ew", pady=3)
             ttk.Label(priorities, text=hint, foreground="#666666").grid(row=row, column=2, sticky="w", padx=(8, 0), pady=3)
 
-        buttons = ttk.Frame(outer)
-        buttons.pack(fill="x", pady=(0, 8))
-        ttk.Button(buttons, text="Start (F8)", command=self.start).pack(side="left")
-        ttk.Button(buttons, text="Stop (F9)", command=self.stop).pack(side="left", padx=(6, 0))
-        ttk.Button(buttons, text="Save settings", command=self.save_from_ui).pack(side="left", padx=(6, 0))
-        ttk.Button(buttons, text="Open templates folder", command=self.open_templates).pack(side="left", padx=(6, 0))
-        ttk.Button(buttons, text="Capture template…", command=self.capture_template).pack(side="left", padx=(6, 0))
-        ttk.Button(buttons, text="Test current screen", command=self.test_current_screen).pack(side="left", padx=(6, 0))
-        ttk.Button(buttons, text="Check templates", command=self.check_templates).pack(side="left", padx=(6, 0))
+        buttons_primary = ttk.Frame(outer)
+        buttons_primary.pack(fill="x", pady=(0, 4))
+        ttk.Button(buttons_primary, text="Start (F8 toggles)", command=self.start).pack(side="left")
+        ttk.Button(buttons_primary, text="Stop (F9)", command=self.stop).pack(side="left", padx=(6, 0))
+        ttk.Button(buttons_primary, text="Save settings", command=self.save_from_ui).pack(side="left", padx=(6, 0))
+        ttk.Button(buttons_primary, text="Export profile…", command=self.export_profile).pack(side="left", padx=(6, 0))
+        ttk.Button(buttons_primary, text="Import profile…", command=self.import_profile).pack(side="left", padx=(6, 0))
+
+        buttons_tools = ttk.Frame(outer)
+        buttons_tools.pack(fill="x", pady=(0, 8))
+        ttk.Button(buttons_tools, text="Open templates folder", command=self.open_templates).pack(side="left")
+        ttk.Button(buttons_tools, text="Calibrate / capture…", command=self.capture_template).pack(side="left", padx=(6, 0))
+        ttk.Button(buttons_tools, text="Manage templates…", command=self.manage_templates).pack(side="left", padx=(6, 0))
+        ttk.Button(buttons_tools, text="Analyze current screen", command=self.test_current_screen).pack(side="left", padx=(6, 0))
+        ttk.Button(buttons_tools, text="Check templates", command=self.check_templates).pack(side="left", padx=(6, 0))
 
         status = ttk.Frame(outer)
         status.pack(fill="x", pady=(0, 6))
@@ -656,6 +824,8 @@ class MicroManagerApp:
             cfg["loop_delay_seconds"] = max(0.2, min(10.0, float(self.loop_delay_var.get())))
             cfg["transition_wait_seconds"] = max(0.5, min(30.0, float(self.transition_var.get())))
             cfg["template_threshold"] = max(0.5, min(0.99, float(self.threshold_var.get())))
+            cfg["screen_change_threshold"] = max(0.05, min(0.5, float(self.screen_change_var.get())))
+            cfg["route_strategy"] = self.route_strategy_var.get()
             cfg["route_priority"] = self._csv(self.route_var.get())
             cfg["gift_priority"] = self._csv(self.gift_var.get())
             cfg["gift_blacklist"] = self._csv(self.blacklist_var.get())
@@ -672,6 +842,69 @@ class MicroManagerApp:
         except (ValueError, OSError) as exc:
             self.messagebox.showerror("Invalid settings", str(exc))
             return False
+
+    def export_profile(self):
+        if not self.save_from_ui(quiet=True):
+            return
+        path = self.filedialog.asksaveasfilename(
+            title="Export farming profile",
+            defaultextension=".json",
+            filetypes=[("JSON profile", "*.json")],
+            initialfile=f"limbus-{self.config.get('mode', 'profile').lower().replace(' ', '-').replace('(', '').replace(')', '')}.json",
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_text(json.dumps(self.config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            self.enqueue_log(f"Exported settings profile to {path}. Template image files are not bundled with profiles.")
+        except OSError as exc:
+            self.messagebox.showerror("Profile export failed", str(exc))
+
+    def import_profile(self):
+        path = self.filedialog.askopenfilename(
+            title="Import farming profile",
+            filetypes=[("JSON profile", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            profile = json.loads(Path(path).read_text(encoding="utf-8"))
+            if not isinstance(profile, dict):
+                raise ValueError("The profile root must be a JSON object.")
+            cfg = copy.deepcopy(DEFAULT_CONFIG)
+            cfg.update(profile)
+            for key in ("state_templates", "action_templates", "node_templates"):
+                merged = copy.deepcopy(DEFAULT_CONFIG[key])
+                if isinstance(cfg.get(key), dict):
+                    merged.update(cfg[key])
+                cfg[key] = merged
+            if cfg.get("mode") not in ("Mirror Dungeon", "Luxcavation (EXP)", "Luxcavation (Thread)"):
+                raise ValueError("Profile has an unsupported farming mode.")
+            if cfg.get("battle_policy") not in ("win_rate", "custom_keys", "manual"):
+                raise ValueError("Profile has an unsupported battle policy.")
+            cfg["clicks_enabled"] = False
+            cfg["config_version"] = 2
+            self.config = cfg
+            self.mode_var.set(cfg["mode"])
+            self.runs_var.set(str(cfg.get("target_runs", 1)))
+            self.policy_var.set(cfg.get("battle_policy", "win_rate"))
+            self.keys_var.set(cfg.get("custom_battle_keys", "p"))
+            self.loop_delay_var.set(str(cfg.get("loop_delay_seconds", 1.0)))
+            self.transition_var.set(str(cfg.get("transition_wait_seconds", 3.0)))
+            self.threshold_var.set(str(cfg.get("template_threshold", 0.88)))
+            self.screen_change_var.set(str(cfg.get("screen_change_threshold", 0.08)))
+            self.route_strategy_var.set(cfg.get("route_strategy", "priority_then_confidence"))
+            self.route_var.set(", ".join(cfg.get("route_priority", [])))
+            self.gift_var.set(", ".join(cfg.get("gift_priority", [])))
+            self.blacklist_var.set(", ".join(cfg.get("gift_blacklist", [])))
+            self.upgrade_var.set(", ".join(cfg.get("upgrade_priority", [])))
+            self.event_var.set(", ".join(cfg.get("event_priority", [])))
+            self.clicks_enabled_var.set(False)
+            if self.save_from_ui(quiet=True):
+                self.enqueue_log(f"Imported profile from {path}. Confirm the template files exist locally before enabling input.")
+                self.worker.matcher = TemplateMatcher(float(self.config.get("template_threshold", 0.88)), self.enqueue_log)
+        except (OSError, json.JSONDecodeError, ValueError, TypeError) as exc:
+            self.messagebox.showerror("Profile import failed", str(exc))
 
     def start(self):
         if not self.save_from_ui(quiet=True):
@@ -703,84 +936,426 @@ class MicroManagerApp:
         self.root.after(120, self._flush_log_queue)
 
     def capture_template(self):
-        """Minimize this window, capture the game screen, and crop a template via OpenCV."""
+        """Open a guided, role-aware template calibration wizard."""
+        if self.worker.thread and self.worker.thread.is_alive() and not self.worker.stop_event.is_set():
+            self.messagebox.showwarning("Stop automation first", "Stop the farming loop before calibrating templates so the screen is not being changed by automation.")
+            return
+        tk, ttk = self.tk, self.ttk
         if cv2 is None or np is None:
             self.messagebox.showerror("Missing dependency", "Install OpenCV with: python -m pip install -r requirements.txt")
             return
-        filename = self.simpledialog.askstring(
-            "Capture template",
-            "Template filename (e.g. state_battle.png or node_shop_available.png):",
-            parent=self.root,
-        )
-        if not filename:
-            return
-        filename = Path(filename.strip()).name
-        if not filename.lower().endswith((".png", ".jpg", ".jpeg", ".bmp")):
-            filename += ".png"
-        if filename in {".", ".."}:
-            self.messagebox.showerror("Invalid filename", "Choose a valid image filename.")
-            return
-        overwrite = (TEMPLATES_DIR / filename).exists()
-        if overwrite and not self.messagebox.askyesno("Overwrite template?", f"{filename} already exists. Replace it?"):
-            return
 
+        cfg = self.get_config()
+        wizard = tk.Toplevel(self.root)
+        wizard.title("Template calibration wizard")
+        wizard.transient(self.root)
+        wizard.resizable(False, False)
+        frame = ttk.Frame(wizard, padding=14)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Calibrate a UI template", font=("TkDefaultFont", 13, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        ttk.Label(frame, text="Choose what the crop represents. State and button captures are automatically linked to the config.", wraplength=500).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        category_var = tk.StringVar(value="State screen")
+        target_var = tk.StringVar(value="battle")
+        name_var = tk.StringVar(value="")
+        ttk.Label(frame, text="Template role").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=5)
+        category_box = ttk.Combobox(frame, textvariable=category_var, state="readonly", width=28, values=[
+            "State screen", "Action button", "Route node", "E.G.O Gift priority",
+            "Shop upgrade priority", "Event option priority", "Gift blacklist",
+        ])
+        category_box.grid(row=2, column=1, sticky="ew", pady=5)
+        target_label = ttk.Label(frame, text="State key")
+        target_label.grid(row=3, column=0, sticky="w", padx=(0, 10), pady=5)
+        target_box = ttk.Combobox(frame, textvariable=target_var, state="readonly", width=28)
+        target_box.grid(row=3, column=1, sticky="ew", pady=5)
+        name_label = ttk.Label(frame, text="Gift/upgrade name")
+        name_label.grid(row=4, column=0, sticky="w", padx=(0, 10), pady=5)
+        name_entry = ttk.Entry(frame, textvariable=name_var, width=30)
+        name_entry.grid(row=4, column=1, sticky="ew", pady=5)
+        ttk.Label(frame, text="Tip: crop a unique heading, button, or card edge; avoid animated text and common backgrounds.", wraplength=500, foreground="#666666").grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 12))
+
+        mapped_categories = {
+            "State screen": ("state_templates", "State key"),
+            "Action button": ("action_templates", "Action key"),
+            "Route node": ("node_templates", "Node type"),
+        }
+        def refresh_target(_event=None):
+            cat = category_var.get()
+            if cat in mapped_categories:
+                dict_key, label_text = mapped_categories[cat]
+                keys = list(cfg.get(dict_key, {}).keys())
+                target_box.configure(values=keys, state="readonly")
+                target_label.configure(text=label_text)
+                if target_var.get() not in keys:
+                    target_var.set(keys[0] if keys else "")
+                name_entry.configure(state="disabled")
+                name_label.configure(text="Filename generated")
+                name_var.set("")
+            else:
+                target_box.configure(values=[], state="disabled")
+                target_var.set("")
+                target_label.configure(text="Target")
+                name_entry.configure(state="normal")
+                name_label.configure(text="Short name / filename")
+                if not name_var.get():
+                    name_var.set("priority_1")
+        category_box.bind("<<ComboboxSelected>>", refresh_target)
+        refresh_target()
+
+        def start_crop():
+            cat = category_var.get()
+            target = target_var.get().strip()
+            raw_name = name_var.get().strip()
+            if cat in mapped_categories and not target:
+                self.messagebox.showerror("Missing target", "Choose a target key.", parent=wizard)
+                return
+            if cat not in mapped_categories and not raw_name:
+                self.messagebox.showerror("Missing name", "Enter a short name for this gift/upgrade/event option.", parent=wizard)
+                return
+
+            if cat == "State screen":
+                filename = f"state_{target}.png"
+            elif cat == "Action button":
+                filename = f"button_{target}.png"
+            elif cat == "Route node":
+                filename = f"node_{target}_available.png"
+            else:
+                stem = Path(raw_name).stem.lower()
+                stem = re.sub(r"[^a-z0-9_-]+", "_", stem).strip("_") or "priority_1"
+                prefix = {
+                    "E.G.O Gift priority": "gift_",
+                    "Shop upgrade priority": "upgrade_",
+                    "Event option priority": "event_",
+                    "Gift blacklist": "gift_",
+                }[cat]
+                if not stem.startswith(prefix):
+                    stem = prefix + stem
+                filename = stem + ".png"
+            filename = Path(filename).name
+            dest = TEMPLATES_DIR / filename
+            if dest.exists() and not self.messagebox.askyesno("Overwrite template?", f"{filename} already exists. Replace it?", parent=wizard):
+                return
+            wizard.destroy()
+            self._capture_crop_and_bind(cat, target, filename)
+
+        footer = ttk.Frame(frame)
+        footer.grid(row=6, column=0, columnspan=2, sticky="e")
+        ttk.Button(footer, text="Cancel", command=wizard.destroy).pack(side="right")
+        ttk.Button(footer, text="Capture screen and crop…", command=start_crop).pack(side="right", padx=(0, 8))
+        wizard.grab_set()
+        wizard.focus_set()
+
+    def _capture_crop_and_bind(self, category: str, target: str, filename: str) -> None:
+        """Capture the game without the main window, then let the user drag a crop in Tk."""
         self.root.iconify()
-        self.enqueue_log(f"Capturing template '{filename}' in 1.2 seconds. Bring the game to the foreground now.")
+        self.enqueue_log(f"Preparing template capture for {filename}; bring the game to the foreground now.")
+
         def do_capture():
+            crop_window = None
             try:
+                from PIL import Image, ImageTk
                 cfg = self.get_config()
                 io = DesktopIO(lambda: cfg, self.enqueue_log)
                 screen = io.screenshot()
-                cv2.namedWindow("Select template crop", cv2.WINDOW_NORMAL)
-                roi = cv2.selectROI("Select template crop", screen, showCrosshair=True, fromCenter=False)
-                cv2.destroyWindow("Select template crop")
-                x, y, w, h = [int(v) for v in roi]
-                if w < 4 or h < 4:
-                    self.enqueue_log("Template capture cancelled (empty selection).")
-                    return
-                TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
-                destination = TEMPLATES_DIR / filename
-                if not cv2.imwrite(str(destination), screen[y:y+h, x:x+w]):
-                    raise RuntimeError("OpenCV could not write the selected image.")
-                self.enqueue_log(f"Saved template: {destination} ({w}×{h}).")
-                self.enqueue_log("Make sure the chosen crop is unique and stable; use Test current screen / dry-run before enabling input.")
+                # Restore the application after the screenshot has already been taken.
+                self.root.deiconify()
+                self.root.lift()
+
+                original_h, original_w = screen.shape[:2]
+                max_w = max(480, min(1160, self.root.winfo_screenwidth() - 80))
+                max_h = max(300, min(650, self.root.winfo_screenheight() - 160))
+                scale = min(1.0, max_w / original_w, max_h / original_h)
+                display_w = max(1, int(original_w * scale))
+                display_h = max(1, int(original_h * scale))
+                rgb = cv2.cvtColor(screen, cv2.COLOR_BGR2RGB)
+                image = Image.fromarray(rgb).resize((display_w, display_h), Image.Resampling.LANCZOS)
+
+                crop_window = self.tk.Toplevel(self.root)
+                crop_window.title(f"Crop template — {filename}")
+                crop_window.geometry(f"{display_w + 32}x{display_h + 100}")
+                crop_window.transient(self.root)
+                outer = self.ttk.Frame(crop_window, padding=8)
+                outer.pack(fill="both", expand=True)
+                self.ttk.Label(outer, text="Drag a rectangle around the smallest distinctive UI element. The crop is mapped back to full-resolution pixels.").pack(anchor="w", pady=(0, 6))
+                canvas = self.tk.Canvas(outer, width=display_w, height=display_h, cursor="crosshair", highlightthickness=1, highlightbackground="#888888")
+                canvas.pack(fill="none", expand=False)
+                photo = ImageTk.PhotoImage(image)
+                canvas.create_image(0, 0, image=photo, anchor="nw")
+                canvas.image = photo
+                selection = {"start": None, "rect": None, "end": None}
+
+                def on_down(event):
+                    x = max(0, min(display_w, event.x))
+                    y = max(0, min(display_h, event.y))
+                    selection["start"] = (x, y)
+                    selection["end"] = (x, y)
+                    if selection["rect"] is not None:
+                        canvas.delete(selection["rect"])
+                    selection["rect"] = canvas.create_rectangle(x, y, x, y, outline="#ff3434", width=2)
+
+                def on_motion(event):
+                    if selection["start"] is None:
+                        return
+                    x = max(0, min(display_w, event.x))
+                    y = max(0, min(display_h, event.y))
+                    selection["end"] = (x, y)
+                    x0, y0 = selection["start"]
+                    canvas.coords(selection["rect"], x0, y0, x, y)
+
+                def save_crop():
+                    if not selection["start"] or not selection["end"]:
+                        self.messagebox.showwarning("No crop selected", "Drag to select a crop first.", parent=crop_window)
+                        return
+                    x0, y0 = selection["start"]
+                    x1, y1 = selection["end"]
+                    left, right = sorted((int(x0 / scale), int(x1 / scale)))
+                    top, bottom = sorted((int(y0 / scale), int(y1 / scale)))
+                    left, top = max(0, left), max(0, top)
+                    right, bottom = min(original_w, right), min(original_h, bottom)
+                    if right - left < 4 or bottom - top < 4:
+                        self.messagebox.showwarning("Crop too small", "Select an area at least 4×4 pixels.", parent=crop_window)
+                        return
+                    TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+                    destination = TEMPLATES_DIR / filename
+                    if not cv2.imwrite(str(destination), screen[top:bottom, left:right]):
+                        raise RuntimeError("OpenCV could not write the selected image.")
+                    crop_window.destroy()
+                    self._bind_template(category, target, filename)
+                    self.enqueue_log(f"Saved {filename} ({right-left}×{bottom-top} pixels).")
+
+                canvas.bind("<ButtonPress-1>", on_down)
+                canvas.bind("<B1-Motion>", on_motion)
+                canvas.bind("<ButtonRelease-1>", on_motion)
+                btns = self.ttk.Frame(outer)
+                btns.pack(fill="x", pady=(8, 0))
+                self.ttk.Button(btns, text="Cancel", command=crop_window.destroy).pack(side="right")
+                self.ttk.Button(btns, text="Save crop and link template", command=save_crop).pack(side="right", padx=(0, 8))
+                crop_window.lift()
+                crop_window.focus_force()
             except Exception as exc:
                 self.enqueue_log(f"Template capture failed: {exc}")
                 self.messagebox.showerror("Template capture failed", str(exc))
-            finally:
+                try:
+                    if crop_window is not None and crop_window.winfo_exists():
+                        crop_window.destroy()
+                except Exception:
+                    pass
                 try:
                     self.root.deiconify()
                     self.root.lift()
                 except Exception:
                     pass
-        self.root.after(1200, do_capture)
+
+        self.root.after(1300, do_capture)
+
+    def _bind_template(self, category: str, target: str, filename: str) -> None:
+        cfg = self.get_config()
+        if category == "State screen":
+            cfg.setdefault("state_templates", {})[target] = filename
+        elif category == "Action button":
+            cfg.setdefault("action_templates", {})[target] = filename
+        elif category == "Route node":
+            cfg.setdefault("node_templates", {})[target] = filename
+        elif category == "E.G.O Gift priority":
+            cfg["gift_priority"] = [filename] + [f for f in cfg.get("gift_priority", []) if f != filename]
+            self.gift_var.set(", ".join(cfg["gift_priority"]))
+        elif category == "Shop upgrade priority":
+            cfg["upgrade_priority"] = [filename] + [f for f in cfg.get("upgrade_priority", []) if f != filename]
+            self.upgrade_var.set(", ".join(cfg["upgrade_priority"]))
+        elif category == "Event option priority":
+            cfg["event_priority"] = [filename] + [f for f in cfg.get("event_priority", []) if f != filename]
+            self.event_var.set(", ".join(cfg["event_priority"]))
+        elif category == "Gift blacklist":
+            cfg["gift_blacklist"] = list(dict.fromkeys(cfg.get("gift_blacklist", []) + [filename]))
+            self.blacklist_var.set(", ".join(cfg["gift_blacklist"]))
+        self.config = cfg
+        if not self.save_from_ui(quiet=True):
+            self.messagebox.showwarning("Settings not fully saved", "Template image was saved, but check the settings file.")
+        self.worker.matcher.clear_cache()
+        self.enqueue_log(f"Linked template '{filename}' as {category}" + (f" → {target}" if target else "") + ".")
+
+    def manage_templates(self) -> None:
+        """Show a small template gallery with preview and safe removal."""
+        from PIL import Image, ImageTk
+        tk, ttk = self.tk, self.ttk
+        win = tk.Toplevel(self.root)
+        win.title("Template library")
+        win.geometry("850x560")
+        win.minsize(700, 450)
+        outer = ttk.Frame(win, padding=10)
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
+        tree = ttk.Treeview(outer, columns=("filename", "role", "dimensions"), show="headings", height=16)
+        tree.heading("filename", text="Filename")
+        tree.heading("role", text="Linked role")
+        tree.heading("dimensions", text="Size")
+        tree.column("filename", width=190, stretch=False)
+        tree.column("role", width=240, stretch=True)
+        tree.column("dimensions", width=100, stretch=False)
+        tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=tree.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        tree.configure(yscrollcommand=scrollbar.set)
+        preview_label = ttk.Label(outer, text="Select a template to preview it.", anchor="center")
+        preview_label.grid(row=0, column=2, sticky="nsew", padx=(12, 0))
+        outer.columnconfigure(2, weight=1)
+        outer.rowconfigure(0, weight=1)
+        cfg = self.get_config()
+
+        def roles_for(filename):
+            roles = []
+            for group, mapping in (("state", cfg.get("state_templates", {})), ("button", cfg.get("action_templates", {})), ("node", cfg.get("node_templates", {}))):
+                roles.extend(f"{group}: {key}" for key, value in mapping.items() if value == filename)
+            for key, title in (("gift_priority", "gift"), ("upgrade_priority", "upgrade"), ("event_priority", "event"), ("gift_blacklist", "blacklist")):
+                if filename in cfg.get(key, []):
+                    roles.append(title)
+            return ", ".join(roles) if roles else "unlinked"
+
+        def refresh():
+            for item in tree.get_children():
+                tree.delete(item)
+            for path in sorted(TEMPLATES_DIR.iterdir() if TEMPLATES_DIR.exists() else []):
+                if path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".bmp"} or not path.is_file():
+                    continue
+                dimensions = "unreadable"
+                try:
+                    with Image.open(path) as im:
+                        dimensions = f"{im.width} × {im.height}"
+                except Exception:
+                    pass
+                tree.insert("", "end", iid=path.name, values=(path.name, roles_for(path.name), dimensions))
+
+        def preview(_event=None):
+            selected = tree.selection()
+            if not selected:
+                return
+            path = TEMPLATES_DIR / selected[0]
+            try:
+                image = Image.open(path).convert("RGB")
+                image.thumbnail((360, 320), Image.Resampling.LANCZOS)
+                photo = ImageTk.PhotoImage(image)
+                preview_label.configure(image=photo, text=f"{path.name}\n{roles_for(path.name)}", compound="top", wraplength=360)
+                preview_label.image = photo
+            except Exception as exc:
+                preview_label.configure(image="", text=f"Could not preview {path.name}: {exc}")
+                preview_label.image = None
+
+        def delete_selected():
+            if self.worker.thread and self.worker.thread.is_alive() and not self.worker.stop_event.is_set():
+                self.messagebox.showwarning("Stop automation first", "Stop automation before deleting templates.", parent=win)
+                return
+            selected = tree.selection()
+            if not selected:
+                return
+            filename = selected[0]
+            if not self.messagebox.askyesno("Delete template?", f"Delete {filename}?\n\nConfig references will remain and will need to be recaptured or relinked.", parent=win):
+                return
+            try:
+                (TEMPLATES_DIR / filename).unlink()
+                self.worker.matcher.clear_cache()
+                self.enqueue_log(f"Deleted template file: {filename}")
+                preview_label.configure(image="", text="Select a template to preview it.")
+                preview_label.image = None
+                refresh()
+            except OSError as exc:
+                self.messagebox.showerror("Delete failed", str(exc), parent=win)
+
+        tree.bind("<<TreeviewSelect>>", preview)
+        buttons = ttk.Frame(outer)
+        buttons.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(10, 0))
+        ttk.Button(buttons, text="Refresh", command=refresh).pack(side="left")
+        ttk.Button(buttons, text="Delete selected…", command=delete_selected).pack(side="left", padx=(6, 0))
+        ttk.Button(buttons, text="Close", command=win.destroy).pack(side="right")
+        refresh()
 
     def test_current_screen(self):
+        """Detect configured states and display an annotated screenshot; sends no input."""
+        if self.worker.thread and self.worker.thread.is_alive() and not self.worker.stop_event.is_set():
+            self.messagebox.showwarning("Stop automation first", "Stop automation before analyzing the screen so the report reflects a stable screen.")
+            return
         try:
+            from PIL import Image, ImageTk
             cfg = self.get_config()
             io = DesktopIO(lambda: cfg, self.enqueue_log)
             screen = io.screenshot()
             matcher = TemplateMatcher(float(cfg.get("template_threshold", 0.88)), self.enqueue_log)
-            state, score = matcher.find_state(screen, cfg.get("state_templates", {}))
-            if state is None:
-                self.enqueue_log("Screen test: no state template matched. No input was sent.")
-                self.messagebox.showwarning("Screen test", "No configured state template matched this screen. No input was sent.\n\nCapture/configure a state template for the current screen.")
-            else:
-                self.enqueue_log(f"Screen test matched: {state} (confidence {score:.2f}). No input was sent.")
-                self.messagebox.showinfo("Screen test", f"Detected state: {state}\nConfidence: {score:.2f}\n\nNo input was sent.")
+            detected_state, detected_score = matcher.find_state(screen, cfg.get("state_templates", {}))
+            rows = []
+            annotated = screen.copy()
+            threshold = float(cfg.get("template_threshold", 0.88))
+            for state_name, filename in cfg.get("state_templates", {}).items():
+                candidate = matcher.best_unfiltered(screen, filename)
+                if candidate is None:
+                    rows.append((state_name, filename, None, None))
+                    continue
+                x, y, score, w, h = candidate
+                passed = score >= threshold
+                rows.append((state_name, filename, score, (x, y)))
+                if passed:
+                    cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 210, 80), 2)
+                    cv2.putText(annotated, f"{state_name} {score:.2f}", (x, max(18, y - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 210, 80), 2, cv2.LINE_AA)
+            rows.sort(key=lambda row: -1.0 if row[2] is None else row[2], reverse=True)
+            report = [f"Detected state: {detected_state or 'none'} (confidence {detected_score:.2f})", f"Active threshold: {threshold:.2f}", "No clicks or key presses were sent.", "", "Per-template best match:"]
+            for state_name, filename, score, location in rows:
+                if score is None:
+                    report.append(f"  {state_name:18} MISSING / unreadable  ({filename})")
+                else:
+                    verdict = "PASS" if score >= threshold else "below threshold"
+                    report.append(f"  {state_name:18} {score:.3f}  {verdict}  at {location}  ({filename})")
+            self.enqueue_log(f"Screen analysis: {detected_state or 'no state'}; confidence {detected_score:.2f}; input not sent.")
+
+            win = self.tk.Toplevel(self.root)
+            win.title("Current screen analysis — no input sent")
+            win.geometry("1120x820")
+            outer = self.ttk.Frame(win, padding=10)
+            outer.pack(fill="both", expand=True)
+            self.ttk.Label(outer, text="Template match report", font=("TkDefaultFont", 12, "bold")).pack(anchor="w")
+            text_box = self.tk.Text(outer, height=11, wrap="none", font=("TkFixedFont", 9))
+            text_box.pack(fill="x", pady=(5, 8))
+            text_box.insert("1.0", "\n".join(report))
+            text_box.configure(state="disabled")
+            sh, sw = annotated.shape[:2]
+            scale = min(1.0, 1080 / sw, 520 / sh)
+            view = cv2.resize(annotated, (max(1, int(sw * scale)), max(1, int(sh * scale))), interpolation=cv2.INTER_AREA)
+            pil = Image.fromarray(cv2.cvtColor(view, cv2.COLOR_BGR2RGB))
+            photo = ImageTk.PhotoImage(pil)
+            image_label = self.ttk.Label(outer, image=photo, anchor="center")
+            image_label.image = photo
+            image_label.pack(fill="both", expand=True)
+            self.ttk.Button(outer, text="Close", command=win.destroy).pack(anchor="e", pady=(6, 0))
         except Exception as exc:
-            self.enqueue_log(f"Screen test failed: {exc}")
-            self.messagebox.showerror("Screen test failed", str(exc))
+            self.enqueue_log(f"Screen analysis failed: {exc}")
+            self.messagebox.showerror("Screen analysis failed", str(exc))
 
     def check_templates(self):
         config = self.get_config()
-        required = set(config.get("state_templates", {}).values())
-        missing = sorted(name for name in required if name and not (TEMPLATES_DIR / name).exists())
-        found = sorted(name for name in required if name and (TEMPLATES_DIR / name).exists())
-        message = f"State templates found: {len(found)}\nMissing: {len(missing)}\n\nFolder: {TEMPLATES_DIR}"
-        if missing:
-            message += "\n\nMissing files:\n" + "\n".join(missing[:20])
-        self.messagebox.showinfo("Template check", message)
+        groups = {
+            "State screens": list(config.get("state_templates", {}).values()),
+            "Action buttons": list(config.get("action_templates", {}).values()),
+            "Route nodes": list(config.get("node_templates", {}).values()),
+            "Gift priority": list(config.get("gift_priority", [])),
+            "Shop upgrades": list(config.get("upgrade_priority", [])),
+            "Event options": list(config.get("event_priority", [])),
+            "Gift blacklist": list(config.get("gift_blacklist", [])),
+        }
+        lines = [f"Template folder: {TEMPLATES_DIR}", ""]
+        missing_all = []
+        for title, names in groups.items():
+            names = [name for name in names if name]
+            found = [name for name in names if (TEMPLATES_DIR / name).is_file()]
+            missing = [name for name in names if not (TEMPLATES_DIR / name).is_file()]
+            lines.append(f"{title}: {len(found)}/{len(names)} found")
+            missing_all.extend((title, name) for name in missing)
+        if missing_all:
+            lines.append("\nMissing files:")
+            lines.extend(f"  [{group}] {name}" for group, name in missing_all[:35])
+            if len(missing_all) > 35:
+                lines.append(f"  … and {len(missing_all) - 35} more")
+        else:
+            lines.append("\nAll configured template references have files.")
+        lines.append("\nThis checks files only; use Analyze current screen to verify matching confidence and location.")
+        self.messagebox.showinfo("Template check", "\n".join(lines))
 
     def open_templates(self):
         try:
@@ -812,9 +1387,12 @@ class MicroManagerApp:
                 self.root.after(0, self.worker.stop)
         def on_release(key):
             pressed.discard(key)
-        self.hotkey_listener = pynput_keyboard.Listener(on_press=on_press, on_release=on_release)
-        self.hotkey_listener.daemon = True
-        self.hotkey_listener.start()
+        try:
+            self.hotkey_listener = pynput_keyboard.Listener(on_press=on_press, on_release=on_release)
+            self.hotkey_listener.daemon = True
+            self.hotkey_listener.start()
+        except Exception as exc:
+            self.enqueue_log(f"Could not start global hotkeys: {exc}. GUI controls still work.")
 
     def _start_ipc_server(self):
         self.ipc_stop = threading.Event()
@@ -879,13 +1457,53 @@ def send_ipc_command(command: str) -> bool:
         return False
 
 
+def run_environment_doctor() -> int:
+    """Print non-invasive dependency and desktop-backend diagnostics."""
+    print("Limbus Micro Manager — environment check")
+    print(f"Python: {sys.version.split()[0]} ({sys.executable})")
+    print(f"Platform: {platform.platform()}")
+    print(f"Desktop: {'Wayland' if is_wayland() else 'X11/Windows/macOS or unknown'}")
+    print(f"WAYLAND_DISPLAY={os.environ.get('WAYLAND_DISPLAY', '') or '(unset)'}")
+    print(f"DISPLAY={os.environ.get('DISPLAY', '') or '(unset)'}")
+    print(f"OpenCV: {'available' if cv2 is not None else 'MISSING'}")
+    print(f"NumPy: {'available' if np is not None else 'MISSING'}")
+    print(f"PyAutoGUI: {'available' if pyautogui is not None else 'unavailable'}")
+    if _PYAUTOGUI_IMPORT_ERROR:
+        print(f"  PyAutoGUI import detail: {_PYAUTOGUI_IMPORT_ERROR}")
+    try:
+        import tkinter
+        print(f"Tkinter: available (Tk {tkinter.TkVersion})")
+    except Exception as exc:
+        print(f"Tkinter: MISSING ({exc})")
+    try:
+        import PIL
+        print(f"Pillow: available ({PIL.__version__})")
+    except Exception as exc:
+        print(f"Pillow: MISSING ({exc})")
+    print(f"pynput global shortcut: {'available' if pynput_keyboard is not None else 'unavailable'}")
+    for executable in ("spectacle", "gnome-screenshot", "grim", "ydotool", "xdg-open"):
+        print(f"{executable}: {shutil.which(executable) or 'not found'}")
+    print(f"Config: {CONFIG_PATH}")
+    print(f"Templates: {TEMPLATES_DIR}")
+    if sys.platform.startswith("linux"):
+        print("Linux Tk fix: Debian/Ubuntu: sudo apt-get install python3-tk python3-dev")
+        print("              Fedora: sudo dnf install python3-tkinter python3-devel")
+    if is_wayland():
+        print("Wayland note: capture needs a supported screenshot utility; input needs a configured ydotool service/daemon.")
+        print("Global shortcut note: create a desktop shortcut invoking this script with --toggle or --stop.")
+    return 0 if cv2 is not None and np is not None else 1
+
+
 def cli_main() -> int:
     parser = argparse.ArgumentParser(description="Limbus Micro Manager")
     parser.add_argument("--toggle", action="store_true", help="toggle Start/Stop in an already running app")
     parser.add_argument("--start", action="store_true", help="start automation in an already running app")
     parser.add_argument("--stop", action="store_true", help="stop automation in an already running app")
+    parser.add_argument("--doctor", action="store_true", help="check Python dependencies and desktop input/capture backends")
     args = parser.parse_args()
     setup_logging()
+    if args.doctor:
+        return run_environment_doctor()
     command = "toggle" if args.toggle else "start" if args.start else "stop" if args.stop else None
     if command:
         # Retry briefly so desktop shortcuts issued while the app launches do not race IPC startup.
