@@ -1278,9 +1278,26 @@ class MicroManagerApp:
             from PIL import Image, ImageTk
             cfg = self.get_config()
             io = DesktopIO(lambda: cfg, self.enqueue_log)
-            screen = io.screenshot()
-            matcher = TemplateMatcher(float(cfg.get("template_threshold", 0.88)), self.enqueue_log)
-            detected_state, detected_score = matcher.find_state(screen, cfg.get("state_templates", {}))
+
+            # Hide the manager so it doesn't appear in the screenshot
+            try:
+                self.root.iconify()
+                self.root.update_idletasks()
+                time.sleep(0.5)
+            
+                screen = io.screenshot()
+            finally:
+                self.root.deiconify()
+                self.root.lift()
+                self.root.update_idletasks()
+
+            matcher = TemplateMatcher(
+                float(cfg.get("template_threshold", 0.88)),
+                self.enqueue_log,
+            )
+            detected_state, detected_score = matcher.find_state(
+                screen, cfg.get("state_templates", {})
+            )
             rows = []
             annotated = screen.copy()
             threshold = float(cfg.get("template_threshold", 0.88))
