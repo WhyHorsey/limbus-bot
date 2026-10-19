@@ -1270,77 +1270,341 @@ class MicroManagerApp:
         refresh()
 
     def test_current_screen(self):
-        """Detect configured states and display an annotated screenshot; sends no input."""
+        """Analyze every configured template role and show locations; never sends input."""
         if self.worker.thread and self.worker.thread.is_alive() and not self.worker.stop_event.is_set():
-            self.messagebox.showwarning("Stop automation first", "Stop automation before analyzing the screen so the report reflects a stable screen.")
+            self.messagebox.showwarning(
+                "Stop automation first",
+                "Stop automation before analyzing the screen so the report reflects a stable screen.",
+            )
             return
         try:
             from PIL import Image, ImageTk
+
             cfg = self.get_config()
             io = DesktopIO(lambda: cfg, self.enqueue_log)
 
-            # Hide the manager so it doesn't appear in the screenshot
+            # Hide the manager so it does not appear in the screenshot.
             try:
                 self.root.iconify()
                 self.root.update_idletasks()
                 time.sleep(0.5)
-            
                 screen = io.screenshot()
             finally:
                 self.root.deiconify()
                 self.root.lift()
                 self.root.update_idletasks()
 
-            matcher = TemplateMatcher(
-                float(cfg.get("template_threshold", 0.88)),
-                self.enqueue_log,
-            )
-            detected_state, detected_score = matcher.find_state(
-                screen, cfg.get("state_templates", {})
-            )
-            rows = []
-            annotated = screen.copy()
-            threshold = float(cfg.get("template_threshold", 0.88))
-            for state_name, filename in cfg.get("state_templates", {}).items():
-                candidate = matcher.best_unfiltered(screen, filename)
-                if candidate is None:
-                    rows.append((state_name, filename, None, None))
+            threshold = max(0.5, min(0.99, float(cfg.get("template_threshold", 0.88))))
+            matcher = TemplateMatcher(threshold, self.enqueue_log)
+            screen_height, screen_width = screen.shape[:2]
+            if len(screen.shape) == 2:
+                annotated = cv2.cvtColor(screen, cv2.COLOR_GRAY2BGR)
+            else:
+                annotated = screen.copy()
+
+            def mapping_items(value):
+                """Convert a config mapping of display name -> filename to valid items."""
+                if not isinstance(value, dict):
+                    return []
+                items = []
+                for name, filename in value.items():
+                    if isinstance(filename, str) and filename.strip():
+                        items.append((str(name), filename.strip()))
+                return items
+
+            def priority_items(value):
+                """Preserve strategy order while ignoring invalid and duplicate entries."""
+                if not isinstance(value, (list, tuple)):
+                    return []
+                items = []
+                seen = set()
+                for index, filename in enumerate(value, start=1):
+                    if not isinstance(filename, str) or not filename.strip():
+                        continue
+                    filename = filename.strip()
+                    if filename in seen:
+                        continue
+                    seen.add(filename)
+                    items.append((f"{index:02d} {Path(filename).stem}", filename))
+                return items
+
+            groups = [
+                ("State screens", "state", mapping_items(cfg.get("state_templates", {}))),
+                ("Action buttons", "action", mapping_items(cfg.get("action_templates", {}))),
+                ("Route nodes", "node", mapping_items(cfg.get("node_templates", {}))),
+                ("E.G.O Gift priority", "gift", priority_items(cfg.get("gift_priority", []))),
+                ("Gift blacklist", "blacklist", priority_items(cfg.get("gift_blacklist", []))),
+                ("Shop upgrade priority", "upgrade", priority_items(cfg.get("upgrade_priority", []))),
+                ("Event option priority", "event", priority_items(cfg.get("event_priority", []))),
+            ]
+
+            # OpenCV uses BGR colors. Labels include role + template name so overlapping
+            # matches from different categories can still be distinguished in the report.
+            colors = {
+                "state": (40, 205, 80),
+                "action": (0, 165, 255),
+                "node": (255, 145, 20),
+                "gift": (200, 70, 210),
+                "blacklist": (30, 30, 245),
+                "upgrade": (0, 220, 255),
+                "event": (255, 220, 40),
+            }
+
+            def match_location(match):
+                x, y, score, width, height = match
+                center = (x + width // 2, y + height // 2)
+                return (
+                    f"x={x}, y={y}, w={width}, h={height}, "
+                    f"center=({center[0]}, {center[1]})"
+                )
+
+            def draw_match(role, name, match, index):
+                x, y, score, width, height = match
+                color = colors.get(role, (220, 220, 220))
+                cv2.rectangle(annotated, (x, y), (x + width, y + height), color, 2)
+                short_name = name if len(name) <= 24 else name[:21] + "..."
+                label = f"{role}:{short_name} {score:.2f}"
+                if index > 1:
+                    label += f" #{index}"
+                label_y = y - 7 if y >= 23 else y + height + 18
+                label_y = max(14, min(screen_height - 4, label_y))
+                cv2.putText(
+                    annotated,
+                    label,
+                    (max(0, x), label_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.48,
+                    color,
+                    1,
+                    cv2.LINE_AA,
+                )
+
+            scanned_groups = []
+            configured_filenames = set()
+            for title, role, items in groups:
+                records = []
+                for name, filename in items:
+                    configured_filenames.add(Path(filename).name)
+                    template_path = TEMPLATES_DIR / filename
+                    template = matcher._read_template(filename)
+
+                    if template is None:
+                        status = "MISSING / unreadable"
+                        if template_path.is_file():
+                            status = "UNREADABLE image"
+                        records.append({
+                            "name": name,
+                            "filename": filename,
+                            "status": status,
+                            "matches": [],
+                            "best": None,
+                        })
+                        continue
+
+                    template_height, template_width = template.shape[:2]
+                    if template_height > screen_height or template_width > screen_width:
+                        records.append({
+                            "name": name,
+                            "filename": filename,
+                            "status": "LARGER THAN SCREENSHOT",
+                            "matches": [],
+                            "best": None,
+                        })
+                        continue
+
+                    # match_all gives every threshold-passing location after non-maximum
+                    # suppression. If there are none, best_unfiltered records the strongest
+                    # below-threshold candidate for calibration diagnostics.
+                    matches = matcher.match_all(screen, filename, threshold)
+                    if matches:
+                        for index, match in enumerate(matches, start=1):
+                            draw_match(role, name, match, index)
+                        records.append({
+                            "name": name,
+                            "filename": filename,
+                            "status": "PASS",
+                            "matches": matches,
+                            "best": matches[0],
+                        })
+                    else:
+                        candidate = matcher.best_unfiltered(screen, filename)
+                        records.append({
+                            "name": name,
+                            "filename": filename,
+                            "status": "BELOW THRESHOLD" if candidate is not None else "NO MATCH DATA",
+                            "matches": [],
+                            "best": candidate,
+                        })
+                scanned_groups.append({"title": title, "role": role, "records": records})
+
+            state_records = scanned_groups[0]["records"] if scanned_groups else []
+            passing_states = [
+                (record["best"][2], record["name"])
+                for record in state_records
+                if record["matches"] and record["best"] is not None
+            ]
+            raw_states = [
+                (record["best"][2], record["name"])
+                for record in state_records
+                if record["best"] is not None
+            ]
+            detected_state = max(passing_states, default=None)
+            top_raw_state = max(raw_states, default=None)
+
+            report = [
+                "READ-ONLY SCREEN ANALYSIS — no mouse clicks or key presses were sent.",
+                f"Screenshot: {screen_width} x {screen_height} pixels",
+                f"Active match threshold: {threshold:.2f}",
+            ]
+            if detected_state:
+                report.append(
+                    f"Detected state: {detected_state[1]} "
+                    f"(score {detected_state[0]:.3f}, passed threshold)"
+                )
+            elif top_raw_state:
+                report.append(
+                    f"Detected state: NONE passed threshold; strongest state candidate: "
+                    f"{top_raw_state[1]} ({top_raw_state[0]:.3f})"
+                )
+            else:
+                report.append("Detected state: NONE (no state template could be evaluated)")
+            report.extend([
+                "",
+                "SUMMARY — template counts refer to configured files; detections are screen locations.",
+            ])
+            for group in scanned_groups:
+                records = group["records"]
+                matched_templates = sum(1 for record in records if record["matches"])
+                detection_count = sum(len(record["matches"]) for record in records)
+                report.append(
+                    f"  {group['title']}: {matched_templates}/{len(records)} templates matched; "
+                    f"{detection_count} location(s)"
+                )
+
+            report.append("")
+            report.append("DETAILS — coordinates and box sizes are in screenshot pixels.")
+            for group in scanned_groups:
+                records = group["records"]
+                report.append("")
+                report.append(f"[{group['title']}]")
+                if not records:
+                    report.append("  No templates configured for this category.")
                     continue
-                x, y, score, w, h = candidate
-                passed = score >= threshold
-                rows.append((state_name, filename, score, (x, y)))
-                if passed:
-                    cv2.rectangle(annotated, (x, y), (x + w, y + h), (0, 210, 80), 2)
-                    cv2.putText(annotated, f"{state_name} {score:.2f}", (x, max(18, y - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 210, 80), 2, cv2.LINE_AA)
-            rows.sort(key=lambda row: -1.0 if row[2] is None else row[2], reverse=True)
-            report = [f"Detected state: {detected_state or 'none'} (confidence {detected_score:.2f})", f"Active threshold: {threshold:.2f}", "No clicks or key presses were sent.", "", "Per-template best match:"]
-            for state_name, filename, score, location in rows:
-                if score is None:
-                    report.append(f"  {state_name:18} MISSING / unreadable  ({filename})")
-                else:
-                    verdict = "PASS" if score >= threshold else "below threshold"
-                    report.append(f"  {state_name:18} {score:.3f}  {verdict}  at {location}  ({filename})")
-            self.enqueue_log(f"Screen analysis: {detected_state or 'no state'}; confidence {detected_score:.2f}; input not sent.")
+                for record in records:
+                    name = record["name"]
+                    filename = record["filename"]
+                    matches = record["matches"]
+                    best = record["best"]
+                    if matches:
+                        report.append(
+                            f"  PASS  {name} ({filename}) — {len(matches)} location(s)"
+                        )
+                        for index, match in enumerate(matches, start=1):
+                            report.append(
+                                f"    #{index} score={match[2]:.3f}; "
+                                f"{match_location(match)}"
+                            )
+                    elif best is not None:
+                        report.append(
+                            f"  BELOW {name} ({filename}) — best score={best[2]:.3f}; "
+                            f"{match_location(best)}"
+                        )
+                    else:
+                        report.append(
+                            f"  {record['status']}: {name} ({filename})"
+                        )
+
+            # A saved PNG/JPEG is not active merely because it exists on disk. It needs
+            # to be linked from one of the categories above before the automation can use it.
+            image_suffixes = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+            try:
+                library_files = sorted(
+                    path.name
+                    for path in TEMPLATES_DIR.iterdir()
+                    if path.is_file() and path.suffix.lower() in image_suffixes
+                )
+            except OSError:
+                library_files = []
+            unlinked_files = [
+                filename for filename in library_files
+                if filename not in configured_filenames
+            ]
+            report.append("")
+            report.append("[Saved image files not linked to a configured role]")
+            if unlinked_files:
+                report.append(
+                    "  These files were not scanned and will not guide automation until linked."
+                )
+                report.extend(f"  UNLINKED: {filename}" for filename in unlinked_files)
+            else:
+                report.append("  None found (or the template library is empty).")
+
+            report.extend([
+                "",
+                "Color legend: state=green, action=orange, node=blue, gift=purple, "
+                "blacklist=red, upgrade=yellow, event option=cyan.",
+                "Priority templates are listed in the order currently saved in your config.",
+            ])
+            self.enqueue_log(
+                f"Screen analysis: {detected_state[1] if detected_state else 'no state passed threshold'}; "
+                f"threshold {threshold:.2f}; "
+                f"{sum(len(record['matches']) for group in scanned_groups for record in group['records'])} "
+                "template location(s); no input sent."
+            )
 
             win = self.tk.Toplevel(self.root)
-            win.title("Current screen analysis — no input sent")
-            win.geometry("1120x820")
+            win.title("Current screen analysis — read-only")
+            win.geometry("1280x920")
             outer = self.ttk.Frame(win, padding=10)
             outer.pack(fill="both", expand=True)
-            self.ttk.Label(outer, text="Template match report", font=("TkDefaultFont", 12, "bold")).pack(anchor="w")
-            text_box = self.tk.Text(outer, height=11, wrap="none", font=("TkFixedFont", 9))
-            text_box.pack(fill="x", pady=(5, 8))
+            self.ttk.Label(
+                outer,
+                text="Template analysis report",
+                font=("TkDefaultFont", 12, "bold"),
+            ).pack(anchor="w")
+
+            report_frame = self.ttk.Frame(outer)
+            report_frame.pack(fill="x", pady=(5, 8))
+            report_frame.columnconfigure(0, weight=1)
+            report_frame.rowconfigure(0, weight=1)
+            text_box = self.tk.Text(
+                report_frame,
+                height=15,
+                wrap="none",
+                font=("TkFixedFont", 9),
+            )
+            vertical_scroll = self.ttk.Scrollbar(
+                report_frame, orient="vertical", command=text_box.yview
+            )
+            horizontal_scroll = self.ttk.Scrollbar(
+                report_frame, orient="horizontal", command=text_box.xview
+            )
+            text_box.configure(
+                yscrollcommand=vertical_scroll.set,
+                xscrollcommand=horizontal_scroll.set,
+            )
+            text_box.grid(row=0, column=0, sticky="nsew")
+            vertical_scroll.grid(row=0, column=1, sticky="ns")
+            horizontal_scroll.grid(row=1, column=0, sticky="ew")
             text_box.insert("1.0", "\n".join(report))
             text_box.configure(state="disabled")
+
             sh, sw = annotated.shape[:2]
-            scale = min(1.0, 1080 / sw, 520 / sh)
-            view = cv2.resize(annotated, (max(1, int(sw * scale)), max(1, int(sh * scale))), interpolation=cv2.INTER_AREA)
+            scale = min(1.0, 1240 / sw, 570 / sh)
+            view = cv2.resize(
+                annotated,
+                (max(1, int(sw * scale)), max(1, int(sh * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
             pil = Image.fromarray(cv2.cvtColor(view, cv2.COLOR_BGR2RGB))
+            image_label = self.ttk.Label(outer, image=None, anchor="center")
             photo = ImageTk.PhotoImage(pil)
-            image_label = self.ttk.Label(outer, image=photo, anchor="center")
+            image_label.configure(image=photo)
             image_label.image = photo
             image_label.pack(fill="both", expand=True)
-            self.ttk.Button(outer, text="Close", command=win.destroy).pack(anchor="e", pady=(6, 0))
+            self.ttk.Button(outer, text="Close", command=win.destroy).pack(
+                anchor="e", pady=(6, 0)
+            )
         except Exception as exc:
             self.enqueue_log(f"Screen analysis failed: {exc}")
             self.messagebox.showerror("Screen analysis failed", str(exc))
