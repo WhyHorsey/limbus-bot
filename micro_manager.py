@@ -1297,6 +1297,11 @@ class MicroManagerApp:
             threshold = max(0.5, min(0.99, float(cfg.get("template_threshold", 0.88))))
             matcher = TemplateMatcher(threshold, self.enqueue_log)
             screen_height, screen_width = screen.shape[:2]
+            screen_gray = cv2.cvtColor(screen, cv2.COLOR_BGR2GRAY) if len(screen.shape) == 3 else screen
+            # Experimental scale search is analyzer-only. Live automation continues to
+            # use TemplateMatcher.match_all() at the template's original dimensions.
+            multiscale_roles = {"node", "gift", "blacklist", "upgrade"}
+            scale_factors = tuple(value / 100.0 for value in range(65, 136, 5))
             if len(screen.shape) == 2:
                 annotated = cv2.cvtColor(screen, cv2.COLOR_GRAY2BGR)
             else:
@@ -1351,19 +1356,24 @@ class MicroManagerApp:
             }
 
             def match_location(match):
-                x, y, score, width, height = match
+                x, y, score, width, height = match[:5]
                 center = (x + width // 2, y + height // 2)
-                return (
+                details = (
                     f"x={x}, y={y}, w={width}, h={height}, "
                     f"center=({center[0]}, {center[1]})"
                 )
+                if len(match) > 5:
+                    details += f", template_scale={match[5]:.2f}x"
+                return details
 
             def draw_match(role, name, match, index):
-                x, y, score, width, height = match
+                x, y, score, width, height = match[:5]
                 color = colors.get(role, (220, 220, 220))
                 cv2.rectangle(annotated, (x, y), (x + width, y + height), color, 2)
                 short_name = name if len(name) <= 24 else name[:21] + "..."
                 label = f"{role}:{short_name} {score:.2f}"
+                if len(match) > 5:
+                    label += f" @{match[5]:.2f}x"
                 if index > 1:
                     label += f" #{index}"
                 label_y = y - 7 if y >= 23 else y + height + 18
@@ -1378,6 +1388,94 @@ class MicroManagerApp:
                     1,
                     cv2.LINE_AA,
                 )
+
+            def same_detection(first, second):
+                """Identify overlapping boxes for one object across positions/scales."""
+                fx, fy, _fs, fw, fh = first[:5]
+                sx, sy, _ss, sw, sh = second[:5]
+                first_cx, first_cy = fx + fw / 2, fy + fh / 2
+                second_cx, second_cy = sx + sw / 2, sy + sh / 2
+                center_close = (
+                    abs(first_cx - second_cx) <= max(6, 0.35 * max(fw, sw))
+                    and abs(first_cy - second_cy) <= max(6, 0.35 * max(fh, sh))
+                )
+                left, top = max(fx, sx), max(fy, sy)
+                right, bottom = min(fx + fw, sx + sw), min(fy + fh, sy + sh)
+                intersection = max(0, right - left) * max(0, bottom - top)
+                smaller_area = min(fw * fh, sw * sh)
+                overlap_of_smaller = intersection / smaller_area if smaller_area else 0.0
+                return center_close or overlap_of_smaller >= 0.60
+
+            def match_multiscale(template):
+                """Match a template at several sizes; analyzer diagnostics only."""
+                base_height, base_width = template.shape[:2]
+                best_candidate = None
+                passing_candidates = []
+                seen_sizes = set()
+                tested_scales = 0
+
+                for requested_scale in scale_factors:
+                    scaled_width = max(1, int(round(base_width * requested_scale)))
+                    scaled_height = max(1, int(round(base_height * requested_scale)))
+                    dimensions = (scaled_width, scaled_height)
+                    if dimensions in seen_sizes:
+                        continue
+                    seen_sizes.add(dimensions)
+                    if scaled_width > screen_width or scaled_height > screen_height:
+                        continue
+                    tested_scales += 1
+
+                    interpolation = cv2.INTER_AREA if requested_scale < 1.0 else cv2.INTER_CUBIC
+                    resized_template = cv2.resize(
+                        template, dimensions, interpolation=interpolation
+                    )
+                    result = cv2.matchTemplate(
+                        screen_gray, resized_template, cv2.TM_CCOEFF_NORMED
+                    )
+                    _min_val, max_val, _min_loc, max_loc = cv2.minMaxLoc(result)
+                    actual_scale = (
+                        scaled_width / base_width + scaled_height / base_height
+                    ) / 2.0
+                    raw_candidate = (
+                        int(max_loc[0]), int(max_loc[1]), float(max_val),
+                        scaled_width, scaled_height, actual_scale,
+                    )
+                    if best_candidate is None or raw_candidate[2] > best_candidate[2]:
+                        best_candidate = raw_candidate
+
+                    ys, xs = np.where(result >= threshold)
+                    if len(xs) == 0:
+                        continue
+                    scale_candidates = sorted(
+                        (
+                            (float(result[y, x]), int(x), int(y))
+                            for x, y in zip(xs, ys)
+                        ),
+                        reverse=True,
+                    )
+                    scale_found = []
+                    for score, x, y in scale_candidates:
+                        candidate = (
+                            x, y, score, scaled_width, scaled_height, actual_scale
+                        )
+                        if any(same_detection(candidate, found) for found in scale_found):
+                            continue
+                        scale_found.append(candidate)
+                        if len(scale_found) >= 20:
+                            break
+                    passing_candidates.extend(scale_found)
+
+                # Merge hits from different scales so one visible object doesn't produce
+                # multiple annotations. Keep the highest-confidence representation.
+                passing_candidates.sort(key=lambda match: match[2], reverse=True)
+                merged = []
+                for candidate in passing_candidates:
+                    if any(same_detection(candidate, found) for found in merged):
+                        continue
+                    merged.append(candidate)
+                    if len(merged) >= 20:
+                        break
+                return merged, best_candidate, tested_scales
 
             scanned_groups = []
             configured_filenames = set()
@@ -1402,7 +1500,11 @@ class MicroManagerApp:
                         continue
 
                     template_height, template_width = template.shape[:2]
-                    if template_height > screen_height or template_width > screen_width:
+                    use_multiscale = role in multiscale_roles
+                    if (
+                        not use_multiscale
+                        and (template_height > screen_height or template_width > screen_width)
+                    ):
                         records.append({
                             "name": name,
                             "filename": filename,
@@ -1412,10 +1514,24 @@ class MicroManagerApp:
                         })
                         continue
 
-                    # match_all gives every threshold-passing location after non-maximum
-                    # suppression. If there are none, best_unfiltered records the strongest
-                    # below-threshold candidate for calibration diagnostics.
-                    matches = matcher.match_all(screen, filename, threshold)
+                    # Multi-scale matching is deliberately limited to selected analyzer
+                    # categories. State, action, and event-option matching stay unchanged.
+                    if use_multiscale:
+                        matches, scale_candidate, tested_scales = match_multiscale(template)
+                        candidate = scale_candidate
+                        if tested_scales == 0:
+                            records.append({
+                                "name": name,
+                                "filename": filename,
+                                "status": "LARGER THAN SCREENSHOT AT TESTED SCALES",
+                                "matches": [],
+                                "best": None,
+                            })
+                            continue
+                    else:
+                        matches = matcher.match_all(screen, filename, threshold)
+                        candidate = None if matches else matcher.best_unfiltered(screen, filename)
+
                     if matches:
                         for index, match in enumerate(matches, start=1):
                             draw_match(role, name, match, index)
@@ -1427,7 +1543,6 @@ class MicroManagerApp:
                             "best": matches[0],
                         })
                     else:
-                        candidate = matcher.best_unfiltered(screen, filename)
                         records.append({
                             "name": name,
                             "filename": filename,
@@ -1455,6 +1570,8 @@ class MicroManagerApp:
                 "READ-ONLY SCREEN ANALYSIS — no mouse clicks or key presses were sent.",
                 f"Screenshot: {screen_width} x {screen_height} pixels",
                 f"Active match threshold: {threshold:.2f}",
+                "Multi-scale analyzer roles: route nodes, E.G.O Gift priorities, gift blacklist, and shop upgrades.",
+                "Template scale range: 0.65x–1.35x in 0.05 increments; fixed-scale categories are unchanged.",
             ]
             if detected_state:
                 report.append(
